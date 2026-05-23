@@ -31,26 +31,36 @@ public struct DiarizationResult: Sendable {
     public private(set) var segments: [SpeakerSegment]
     public var timings: (any DiarizationTimings)?
 
+    /// Mean (centroid) embedding vector per detected speaker, keyed by
+    /// `clusterId` (the same id surfaced via `SpeakerInfo.speakerId`).
+    /// Empty when the underlying diarizer doesn't expose embeddings.
+    /// Vectors are L2-normalised pre-PLDA — comparable across meetings
+    /// via cosine similarity. Poliscribe (downstream) uses this for
+    /// cross-meeting speaker re-identification (v2.1).
+    public private(set) var speakerEmbeddings: [Int: [Float]] = [:]
+
     /// Pyannote init: builds segments from binary speaker activity matrix
-    init(binaryMatrix: [[Int]], diarizationFrameRate: Float) {
+    init(binaryMatrix: [[Int]], diarizationFrameRate: Float, speakerEmbeddings: [Int: [Float]] = [:]) {
         self.binaryMatrix = binaryMatrix
         self.frameRate = diarizationFrameRate
         self.speakerCount = binaryMatrix.count
         self.totalFrames = speakerCount > 0 ? binaryMatrix[0].count : 0
         self.segments = []
         self.timings = nil
+        self.speakerEmbeddings = speakerEmbeddings
 
         self.updateSegments(minActiveOffset: 0.0)
     }
 
     /// Generic init: for engines that produce segments directly
-    public init(speakerCount: Int, totalFrames: Int, frameRate: Float, segments: [SpeakerSegment], timings: (any DiarizationTimings)? = nil) {
+    public init(speakerCount: Int, totalFrames: Int, frameRate: Float, segments: [SpeakerSegment], timings: (any DiarizationTimings)? = nil, speakerEmbeddings: [Int: [Float]] = [:]) {
         self.binaryMatrix = []
         self.speakerCount = speakerCount
         self.totalFrames = totalFrames
         self.frameRate = frameRate
         self.segments = segments
         self.timings = timings
+        self.speakerEmbeddings = speakerEmbeddings
     }
 
     public mutating func updateSegments(minActiveOffset: Float) {

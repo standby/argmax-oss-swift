@@ -281,6 +281,38 @@ actor PyannoteDiarizerActor {
         }
 
         let speakerCount = (speakerEmbeddings.map { $0.clusterId }.max() ?? 0) + 1
+
+        // Per-cluster centroid: mean of the L2-normalised raw
+        // embeddings belonging to each cluster. Downstream consumers
+        // (e.g. Poliscribe's cross-meeting speaker re-ID library) use
+        // these for cosine-similarity matching across meetings — the
+        // PLDA-projected variant is meeting-local and not comparable
+        // across runs, so the centroid here is intentionally pre-PLDA.
+        var centroidSums: [Int: [Float]] = [:]
+        var centroidCounts: [Int: Int] = [:]
+        for embedding in speakerEmbeddings {
+            let cid = embedding.clusterId
+            guard cid >= 0 else { continue }
+            if centroidSums[cid] == nil {
+                centroidSums[cid] = embedding.embedding
+                centroidCounts[cid] = 1
+            } else {
+                var running = centroidSums[cid]!
+                let next = embedding.embedding
+                let n = Swift.min(running.count, next.count)
+                for i in 0..<n {
+                    running[i] += next[i]
+                }
+                centroidSums[cid] = running
+                centroidCounts[cid] = (centroidCounts[cid] ?? 0) + 1
+            }
+        }
+        var centroids: [Int: [Float]] = [:]
+        for (cid, sum) in centroidSums {
+            let count = Float(centroidCounts[cid] ?? 1)
+            guard count > 0 else { continue }
+            centroids[cid] = sum.map { $0 / count }
+        }
         let chunkLength = SpeakerSegmenterModel.chunkLengthInSeconds
         let maxChunks = config.segmenterModel.maxChunks(for: originalLength)
 
@@ -360,7 +392,11 @@ actor PyannoteDiarizerActor {
             }
         }
 
-        return DiarizationResult(binaryMatrix: binaryDiarization, diarizationFrameRate: diarizationFrameRate)
+        return DiarizationResult(
+            binaryMatrix: binaryDiarization,
+            diarizationFrameRate: diarizationFrameRate,
+            speakerEmbeddings: centroids
+        )
     }
 
     func diarize(audioArray: [Float], options: (any DiarizationOptions)?, progressCallback: (@Sendable (Progress) -> Void)?) async throws -> DiarizationResult {
