@@ -75,7 +75,20 @@ public final class PyannoteDiarizer: Diarizer, @unchecked Sendable {
         options: (any DiarizationOptions)? = nil,
         progressCallback: (@Sendable (Progress) -> Void)? = nil
     ) async throws -> DiarizationResult {
-        try await diarizerActor.diarize(audioArray: audioArray, options: options, progressCallback: progressCallback)
+        try await diarizerActor.diarize(source: ArrayAudioChunkSource(audioArray), options: options, progressCallback: progressCallback)
+    }
+
+    /// Diarize directly from an audio file, streaming 30s windows from disk so
+    /// the full decoded PCM is never resident. Output is equivalent to
+    /// `diarize(audioArray:)` on the same audio.
+    public func diarize(
+        audioFile url: URL,
+        sampleRate: Int = 16_000,
+        options: (any DiarizationOptions)? = nil,
+        progressCallback: (@Sendable (Progress) -> Void)? = nil
+    ) async throws -> DiarizationResult {
+        let source = try FileAudioChunkSource(url: url, sampleRate: sampleRate)
+        return try await diarizerActor.diarize(source: source, options: options, progressCallback: progressCallback)
     }
 }
 
@@ -143,7 +156,7 @@ actor PyannoteDiarizerActor {
     }
 
     func initialize(
-        audioArray: [Float],
+        source: any AudioChunkSource,
         options: PyannoteDiarizationOptions? = nil,
         progressCallback: (@Sendable (Progress) -> Void)? = nil
     ) async throws {
@@ -151,10 +164,10 @@ actor PyannoteDiarizerActor {
         timings.pipelineStart = CFAbsoluteTimeGetCurrent()
 
         try await loadModels()
-        audioLength = audioArray.count
+        audioLength = source.sampleCount
 
-        let seekClips = prepareSeekClips(contentFrames: audioArray.count, options: options)
-        Logging.debug("[PyannoteDiarizer] audioArray: \(audioArray.count), seekClips: \(seekClips)")
+        let seekClips = prepareSeekClips(contentFrames: source.sampleCount, options: options)
+        Logging.debug("[PyannoteDiarizer] audio samples: \(source.sampleCount), seekClips: \(seekClips)")
 
         let totalAudioSeconds = seekClips.reduce(0.0) { $0 + Double($1.1 - $1.0) / Double(WhisperKit.sampleRate) }
 
@@ -174,17 +187,18 @@ actor PyannoteDiarizerActor {
             for (seekClipStart, seekClipEnd) in seekClips {
                 try Task.checkCancellation()
 
-                // Avoid copying the whole recording when the clip spans the
-                // entire array (the default — no clipTimestamps). `audioArray`
-                // is a CoW [Float]; passing it through shares the buffer
-                // instead of allocating a second ~full-length copy.
-                let audioClip = (seekClipStart == 0 && seekClipEnd == audioArray.count)
-                    ? audioArray
-                    : Array(audioArray[seekClipStart..<seekClipEnd])
-                let clipSeconds = Double(audioClip.count) / Double(WhisperKit.sampleRate)
+                let clipCount = seekClipEnd - seekClipStart
+                // Whole-file clip → stream directly from the source; a sub-clip
+                // (only when clipTimestamps are supplied) wraps it with an
+                // offset. The segmenter pulls 30s windows on demand either way,
+                // so the full recording is never resident.
+                let clipSource: any AudioChunkSource = (seekClipStart == 0 && seekClipEnd == source.sampleCount)
+                    ? source
+                    : OffsetAudioChunkSource(base: source, offset: seekClipStart, count: clipCount)
+                let clipSeconds = Double(clipCount) / Double(WhisperKit.sampleRate)
                 self.timings.inputAudioSeconds += clipSeconds
 
-                let expectedChunks = max(1, segmenterModel.maxChunks(for: audioClip.count))
+                let expectedChunks = max(1, segmenterModel.maxChunks(for: clipCount))
                 let counter = EmbeddingBatchCounter()
 
                 let embedderWorkerCount = concurrentEmbedderWorkers ?? min(8, max(2, Int(clipSeconds / 30.0)))
@@ -217,7 +231,7 @@ actor PyannoteDiarizerActor {
 
                     group.addTask {
                         let segmenterStart = CFAbsoluteTimeGetCurrent()
-                        try await segmenterModel.predict(audioArray: audioClip, outputContinuation: outputContinuation)
+                        try await segmenterModel.predict(source: clipSource, outputContinuation: outputContinuation)
                         await counter.addSegmenterTime((CFAbsoluteTimeGetCurrent() - segmenterStart) * 1_000)
                     }
 
@@ -405,11 +419,11 @@ actor PyannoteDiarizerActor {
         )
     }
 
-    func diarize(audioArray: [Float], options: (any DiarizationOptions)?, progressCallback: (@Sendable (Progress) -> Void)?) async throws -> DiarizationResult {
+    func diarize(source: any AudioChunkSource, options: (any DiarizationOptions)?, progressCallback: (@Sendable (Progress) -> Void)?) async throws -> DiarizationResult {
         let opts = options as? PyannoteDiarizationOptions
 
         guard let progressCallback else {
-            try await initialize(audioArray: audioArray, options: opts, progressCallback: nil)
+            try await initialize(source: source, options: opts, progressCallback: nil)
             var result = try await clusterSpeakers(with: config.clusterer, options: opts, progressCallback: nil)
             if let minActiveOffset = opts?.minActiveOffset {
                 result.updateSegments(minActiveOffset: minActiveOffset)
@@ -422,7 +436,7 @@ actor PyannoteDiarizerActor {
         let diarizationProgress = Progress(totalUnitCount: 100)
         progressCallback(diarizationProgress)
 
-        try await initialize(audioArray: audioArray, options: opts) { @Sendable child in
+        try await initialize(source: source, options: opts) { @Sendable child in
             let value = Int64(child.fractionCompleted * 85)
             if value > diarizationProgress.completedUnitCount {
                 diarizationProgress.completedUnitCount = value

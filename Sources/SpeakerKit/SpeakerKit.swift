@@ -70,6 +70,26 @@ open class SpeakerKit: @unchecked Sendable {
         return try await diarizer.diarize(audioArray: audioArray, options: options, progressCallback: progressCallback)
     }
 
+    /// Diarize directly from an audio file, streaming 30 s windows from disk so
+    /// the full decoded PCM is never held in memory — use this for long
+    /// recordings to keep peak memory low. Output matches `diarize(audioArray:)`
+    /// on the same audio.
+    ///
+    /// - Parameters:
+    ///   - audioFile: A file readable by `AVAudioFile`.
+    ///   - sampleRate: Target rate the models expect (16 kHz).
+    ///   - options: Diarization options. Nil uses the defaults.
+    ///   - progressCallback: Optional callback for progress updates.
+    open func diarize(
+        audioFile url: URL,
+        sampleRate: Int = 16_000,
+        options: (any DiarizationOptions)? = nil,
+        progressCallback: (@Sendable (Progress) -> Void)? = nil
+    ) async throws -> DiarizationResult {
+        try await ensureModelsLoaded()
+        return try await diarizer.diarize(audioFile: url, sampleRate: sampleRate, options: options, progressCallback: progressCallback)
+    }
+
     /// Builds RTTM lines from a diarization result, optionally aligned to a transcription.
     /// - Parameters:
     ///   - diarizationResult: Result from `diarize(audioArray:options:)`.

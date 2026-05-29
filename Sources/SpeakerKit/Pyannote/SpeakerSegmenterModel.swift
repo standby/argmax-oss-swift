@@ -123,6 +123,16 @@ public class SpeakerSegmenterModel: @unchecked Sendable {
         outputContinuation: AsyncStream<SpeakerSegmenterOutput>.Continuation,
         windowPadding: Int = 0
     ) async throws {
+        try await predict(source: ArrayAudioChunkSource(audioArray),
+                          outputContinuation: outputContinuation,
+                          windowPadding: windowPadding)
+    }
+
+    public func predict(
+        source: any AudioChunkSource,
+        outputContinuation: AsyncStream<SpeakerSegmenterOutput>.Continuation,
+        windowPadding: Int = 0
+    ) async throws {
         defer { outputContinuation.finish() }
 
         guard let model else {
@@ -136,7 +146,7 @@ public class SpeakerSegmenterModel: @unchecked Sendable {
         }
 
         var chunkEndIndex = 0
-        let audioArrayCount = audioArray.count
+        let audioArrayCount = source.sampleCount
         let maxIndex = audioArrayCount - windowPadding
 
         let maxChunkLength = Int(Self.chunkLengthInSeconds) * sampleRate
@@ -172,12 +182,12 @@ public class SpeakerSegmenterModel: @unchecked Sendable {
             let sampleRateFloat = Float(sampleRate)
             let chunkStride = Int(Float(maxChunkLength - chunkStrideOffset) / sampleRateFloat)
             for workerID in 0..<workerCount {
-                taskGroup.addTask { [model, audioArray] in
+                taskGroup.addTask { [model, source] in
                     for await range in chunkStream {
                         guard !Task.isCancelled else { break }
-                        // Slice this window's samples on demand (CoW share of
-                        // the read-only input — concurrent slicing is safe).
-                        let waveform = Array(audioArray[range.start..<range.end])
+                        // Pull this window's samples on demand and discard them
+                        // after inference; concurrent reads are safe.
+                        let waveform = source.samples(start: range.start, count: range.end - range.start)
                         Logging.debug("[SpeakerSegmenter][\(workerID)] inferring chunk \(range.index) count: \(waveform.count)")
 
                         var output: SpeakerSegmenterOutput
