@@ -141,21 +141,26 @@ public class SpeakerSegmenterModel: @unchecked Sendable {
 
         let maxChunkLength = Int(Self.chunkLengthInSeconds) * sampleRate
 
-        var chunks: [(index: Int, waveform: [Float])] = []
+        // Pre-compute only each chunk's (index, range) — not its audio. The
+        // waveform for a window is sliced from `audioArray` on demand inside
+        // the worker below and discarded right after inference, so we never
+        // hold every 30s window of a long recording in memory at once.
+        // Materializing all chunks up front cost ~the whole recording again
+        // (≈768 MB for a 200-min meeting) on top of the input array.
+        var chunkRanges: [(index: Int, start: Int, end: Int)] = []
         var chunkIndex = 0
         let chunkStrideOffset = useFullRedundancy ? modelChunkStrideOffset : 0
         while chunkEndIndex < maxIndex {
             let chunkStartIndex = max(chunkEndIndex - chunkStrideOffset, 0)
             chunkEndIndex = min(chunkStartIndex + maxChunkLength, audioArrayCount)
-            let chunk = Array(audioArray[chunkStartIndex..<chunkEndIndex])
-            chunks.append((index: chunkIndex, waveform: chunk))
+            chunkRanges.append((index: chunkIndex, start: chunkStartIndex, end: chunkEndIndex))
             chunkIndex += 1
         }
         Logging.debug("[SpeakerSegmenter] split \(audioArrayCount) into \(chunkIndex) chunks with stride offset \(chunkStrideOffset)")
 
-        let chunkStream = AsyncStream<(index: Int, waveform: [Float])> { continuation in
-            for chunk in chunks {
-                continuation.yield(chunk)
+        let chunkStream = AsyncStream<(index: Int, start: Int, end: Int)> { continuation in
+            for range in chunkRanges {
+                continuation.yield(range)
             }
             continuation.finish()
         }
@@ -167,16 +172,19 @@ public class SpeakerSegmenterModel: @unchecked Sendable {
             let sampleRateFloat = Float(sampleRate)
             let chunkStride = Int(Float(maxChunkLength - chunkStrideOffset) / sampleRateFloat)
             for workerID in 0..<workerCount {
-                taskGroup.addTask { [model] in
-                    for await chunk in chunkStream {
+                taskGroup.addTask { [model, audioArray] in
+                    for await range in chunkStream {
                         guard !Task.isCancelled else { break }
-                        Logging.debug("[SpeakerSegmenter][\(workerID)] inferring chunk \(chunk.index) count: \(chunk.waveform.count)")
+                        // Slice this window's samples on demand (CoW share of
+                        // the read-only input — concurrent slicing is safe).
+                        let waveform = Array(audioArray[range.start..<range.end])
+                        Logging.debug("[SpeakerSegmenter][\(workerID)] inferring chunk \(range.index) count: \(waveform.count)")
 
                         var output: SpeakerSegmenterOutput
-                        let waveformLength = Float(chunk.waveform.count) / sampleRateFloat
+                        let waveformLength = Float(waveform.count) / sampleRateFloat
                         do {
                             guard let audioSamples = AudioProcessor.padOrTrimAudio(
-                                fromArray: chunk.waveform,
+                                fromArray: waveform,
                                 startAt: 0,
                                 toLength: maxChunkLength
                             ) else {
@@ -188,25 +196,25 @@ public class SpeakerSegmenterModel: @unchecked Sendable {
                             let outputFeatures = try await model.asyncPrediction(from: modelInputs, options: MLPredictionOptions())
                             output = SpeakerSegmenterOutput(
                                 features: outputFeatures,
-                                chunkIndex: chunk.index,
+                                chunkIndex: range.index,
                                 audioChunk: audioSamples,
                                 chunkStride: chunkStride,
                                 waveformLength: waveformLength,
                                 modelSampleRate: modelSampleRate,
                                 audioSampleRate: sampleRateFloat
                             )
-                            Logging.debug("[SpeakerSegmenter][\(workerID)] inference for chunk \(chunk.index) took \(CFAbsoluteTimeGetCurrent() - start)")
+                            Logging.debug("[SpeakerSegmenter][\(workerID)] inference for chunk \(range.index) took \(CFAbsoluteTimeGetCurrent() - start)")
                         } catch {
                             output = SpeakerSegmenterOutput(
                                 features: NoOpMLFeatureProvider(),
-                                chunkIndex: chunk.index,
+                                chunkIndex: range.index,
                                 audioChunk: MLMultiArray(),
                                 chunkStride: chunkStride,
                                 waveformLength: waveformLength,
                                 modelSampleRate: modelSampleRate,
                                 audioSampleRate: sampleRateFloat
                             )
-                            Logging.debug("[SpeakerSegmenter][\(workerID)] inference for chunk \(chunk.index) encountered an error: \(error)")
+                            Logging.debug("[SpeakerSegmenter][\(workerID)] inference for chunk \(range.index) encountered an error: \(error)")
                         }
                         outputContinuation.yield(output)
                     }

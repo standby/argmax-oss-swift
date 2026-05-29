@@ -174,7 +174,13 @@ actor PyannoteDiarizerActor {
             for (seekClipStart, seekClipEnd) in seekClips {
                 try Task.checkCancellation()
 
-                let audioClip = Array(audioArray[seekClipStart..<seekClipEnd])
+                // Avoid copying the whole recording when the clip spans the
+                // entire array (the default — no clipTimestamps). `audioArray`
+                // is a CoW [Float]; passing it through shares the buffer
+                // instead of allocating a second ~full-length copy.
+                let audioClip = (seekClipStart == 0 && seekClipEnd == audioArray.count)
+                    ? audioArray
+                    : Array(audioArray[seekClipStart..<seekClipEnd])
                 let clipSeconds = Double(audioClip.count) / Double(WhisperKit.sampleRate)
                 self.timings.inputAudioSeconds += clipSeconds
 
